@@ -1,4 +1,7 @@
 #include "SuziePlugin.h"
+#include "SuzieGameplayTags.h"
+#include "SuzieSchemaOverride.h"
+#include "SuzieCustomSerializers.h"
 #include "Misc/FileHelper.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -17,6 +20,9 @@
 #include "SuzieDecompressionHelper.h"
 #include "Widgets/Docking/SDockTab.h"
 #include "UObject/UObjectAllocator.h"
+#include "UObject/UObjectHash.h"
+#include "UObject/SparseDelegate.h"
+#include "Serialization/AsyncLoadingEvents.h"
 #include "Misc/ScopedSlowTask.h"
 #include "Engine/NetConnection.h"
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
@@ -32,11 +38,28 @@ void FSuziePluginModule::StartupModule()
     UE_LOG(LogSuzie, Display, TEXT("Suzie plugin starting"));
 
     ProcessAllJsonClassDefinitions();
+
+    // Register our freshly generated /Script/ classes with the IoStore loader's global import store.
+    // The loader registered all script objects early in startup (before this PostEngineInit module
+    // ran), so cooked game packages reference our classes by a script-import hash the loader cannot
+    // yet resolve - opening such an asset fails with "Could not find class object". Re-running the
+    // registration is idempotent and additive (it only adds the new /Script/UWE* objects), and makes
+    // those hashes resolve so cooked content whose class is Suzie-generated can load.
+    NotifyRegistrationComplete();
+
+    // Must run while native tag registration is still open: DoneAddingNativeTags is bound to the
+    // OnPostEngineInit broadcast, which fires after PostEngineInit plugin modules load
+    FSuzieGameplayTags::Get().RegisterCollectedTags();
+
+    // Activate game-accurate unversioned schemas for cooked content (no-op if nothing diverges)
+    FSuzieSchemaOverrides::Get().RegisterProvider();
 }
 
 void FSuziePluginModule::ShutdownModule()
 {
     UE_LOG(LogSuzie, Display, TEXT("Suzie plugin shutting down"));
+
+    FSuzieSchemaOverrides::Get().UnregisterProvider();
 }
 
 void FSuziePluginModule::ProcessAllJsonClassDefinitions()
@@ -156,6 +179,13 @@ void FSuziePluginModule::CreateDynamicClassesForJsonObject(const TSharedPtr<FJso
     for (auto It = (*Objects)->Values.CreateConstIterator(); It; ++It)
     {
         FString ObjectPath = It.Key();
+        // Full (--all) dumps also contain game content: BlueprintGeneratedClasses show up as
+        // "Class" entries but must be loaded from their cooked packages, not generated as native
+        // classes. Only /Script/ objects describe native types.
+        if (!ObjectPath.StartsWith(TEXT("/Script/")))
+        {
+            continue;
+        }
         FString Type = It.Value()->AsObject()->GetStringField(TEXT("type"));
         if (Type == TEXT("Class"))
         {
@@ -206,6 +236,19 @@ void FSuziePluginModule::CreateDynamicClassesForJsonObject(const TSharedPtr<FJso
     {
         FinalizeClass(ClassGenerationContext, ClassPendingFinalization);
     }
+
+    // Harvest the game's per-class property order for unversioned schema overrides. This must
+    // happen after class generation so jmap property descriptors of native classes resolve their
+    // type references against already-created dynamic types.
+    FSuzieSchemaOverrides::Get().BuildFromJmap(*Objects,
+        [this, &ClassGenerationContext](FFieldVariant Owner, const TSharedPtr<FJsonObject>& PropertyJson) -> FProperty*
+        {
+            return BuildProperty(ClassGenerationContext, Owner, PropertyJson);
+        });
+
+    // Collect the game's gameplay tags from dumped GameplayTagsList instances (full dumps only);
+    // registration happens once after all files are processed
+    FSuzieGameplayTags::Get().CollectFromJmap(*Objects);
 }
 
 UPackage* FSuziePluginModule::FindOrCreatePackage(FDynamicClassGenerationContext& Context, const FString& PackageName)
@@ -261,7 +304,7 @@ UClass* FSuziePluginModule::FindOrCreateUnregisteredClass(FDynamicClassGeneratio
     UClass* ParentClass = ParentClassPath.IsEmpty() ? UClass::StaticClass() : FindOrCreateClass(Context, ParentClassPath);
     if (!ParentClass)
     {
-        UE_LOG(LogSuzie, Error, TEXT("Parent class not found: %s"), *ParentClassPath);
+        UE_LOG(LogSuzie, Warning, TEXT("Parent class not found: %s"), *ParentClassPath);
         return nullptr;
     }
     
@@ -395,6 +438,232 @@ public:
 #endif
 };
 
+// Synthetic CppStructOps for dynamic structs that inherit from native structs with CppStructOps (e.g. FTableRowBase).
+// Ensures proper vtable initialization when struct memory is allocated, preventing crashes on virtual function calls.
+// Without this, structs like DataTable row types that inherit from FTableRowBase would have a null vtable pointer,
+// causing crashes when the engine calls virtual methods like OnDataTableChanged().
+class FDynamicStructCppStructOps : public UScriptStruct::ICppStructOps
+{
+    UScriptStruct::ICppStructOps* ParentCppStructOps;
+    UScriptStruct* DynamicStruct;
+    int32 ParentInitializedSize;
+    bool bHasDestructor;
+    // Optional hand-written binary serializer for game structs serialized natively in the cooked data
+    // (STRUCT_SerializeNative). When set, GetCapabilities reports HasSerializer so PrepareCppStructOps
+    // flags the struct STRUCT_SerializeNative and SerializeItem routes through this instead of the
+    // tagged/unversioned property path. See SuzieCustomSerializers.
+    SuzieCustomSerializers::FStructSerializeFn CustomSerializeFn;
+
+public:
+    FDynamicStructCppStructOps(int32 InSize, int32 InAlignment, UScriptStruct::ICppStructOps* InParentOps, UScriptStruct* InStruct, SuzieCustomSerializers::FStructSerializeFn InSerializeFn = nullptr)
+        : ICppStructOps(InSize, InAlignment)
+        , ParentCppStructOps(InParentOps)
+        , DynamicStruct(InStruct)
+        , ParentInitializedSize(InParentOps ? InParentOps->GetSize() : 0)
+        , bHasDestructor(false)
+        , CustomSerializeFn(InSerializeFn)
+    {
+        // Destructor is needed if the parent needs destruction or if any child properties need destruction
+        if (InParentOps && InParentOps->HasDestructor())
+        {
+            bHasDestructor = true;
+        }
+        if (!bHasDestructor && InStruct)
+        {
+            for (FProperty* P = InStruct->DestructorLink; P; P = P->DestructorLinkNext)
+            {
+                if (!P->IsInContainer(ParentInitializedSize) && !P->HasAnyPropertyFlags(CPF_NoDestructor))
+                {
+                    bHasDestructor = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    virtual FCapabilities GetCapabilities() const override
+    {
+        FCapabilities Caps = {};
+        Caps.HasZeroConstructor = false;
+        Caps.HasDestructor = bHasDestructor;
+        Caps.IsPlainOldData = false;
+        Caps.HasNoopConstructor = false;
+        Caps.HasSerializer = (CustomSerializeFn != nullptr);
+        return Caps;
+    }
+
+    virtual void Construct(void* Dest) override
+    {
+        // Zero the entire buffer to ensure deterministic initialization regardless of prior memory content
+        FMemory::Memzero(Dest, GetSize());
+
+        // Call parent's constructor to initialize the vtable pointer
+        if (ParentCppStructOps && !ParentCppStructOps->HasZeroConstructor())
+        {
+            ParentCppStructOps->Construct(Dest);
+        }
+
+        // Initialize child properties that need non-zero construction
+        if (DynamicStruct)
+        {
+            for (FProperty* Property = DynamicStruct->PropertyLink; Property; Property = Property->PropertyLinkNext)
+            {
+                if (!Property->IsInContainer(ParentInitializedSize) && !Property->HasAnyPropertyFlags(CPF_ZeroConstructor))
+                {
+                    Property->InitializeValue_InContainer(Dest);
+                }
+            }
+        }
+    }
+
+    virtual void ConstructForTests(void* Dest) override
+    {
+        Construct(Dest);
+    }
+
+    virtual void Destruct(void* Dest) override
+    {
+        // Destroy child properties that need destruction
+        if (DynamicStruct)
+        {
+            for (FProperty* P = DynamicStruct->DestructorLink; P; P = P->DestructorLinkNext)
+            {
+                if (!P->IsInContainer(ParentInitializedSize) && !P->HasAnyPropertyFlags(CPF_NoDestructor))
+                {
+                    P->DestroyValue_InContainer(Dest);
+                }
+            }
+        }
+        // Call parent's destructor for C++ cleanup (vtable, etc.)
+        if (ParentCppStructOps && ParentCppStructOps->HasDestructor())
+        {
+            ParentCppStructOps->Destruct(Dest);
+        }
+    }
+
+    // Route through the hand-written binary serializer when one is registered for this struct.
+    // We only implement the FArchive form (HasStructuredSerializer stays false), so SerializeItem
+    // adapts structured archives to an FArchive for us. Returning false falls back to default.
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 6
+    virtual bool Serialize(FArchive& Ar, void* Data, UStruct* DefaultsStruct, const void* Defaults) override
+    {
+        return CustomSerializeFn ? CustomSerializeFn(Ar, Data, DynamicStruct) : false;
+    }
+    virtual bool Serialize(FStructuredArchive::FSlot Slot, void* Data, UStruct* DefaultsStruct, const void* Defaults) override { return false; }
+#else
+    virtual bool Serialize(FArchive& Ar, void* Data) override
+    {
+        return CustomSerializeFn ? CustomSerializeFn(Ar, Data, DynamicStruct) : false;
+    }
+    virtual bool Serialize(FStructuredArchive::FSlot Slot, void* Data) override { return false; }
+#endif
+    virtual void PostSerialize(const FArchive& Ar, void* Data) override {}
+    virtual bool NetSerialize(FArchive& Ar, class UPackageMap* Map, bool& bOutSuccess, void* Data) override { return false; }
+    virtual bool NetDeltaSerialize(FNetDeltaSerializeInfo& DeltaParms, void* Data) override { return false; }
+    virtual void PostScriptConstruct(void* Data) override {}
+    virtual void GetPreloadDependencies(void* Data, TArray<UObject*>& OutDeps) override {}
+    virtual bool Copy(void* Dest, void const* Src, int32 ArrayDim) override { return false; }
+    virtual bool Identical(const void* A, const void* B, uint32 PortFlags, bool& bOutResult) override { return false; }
+    virtual bool ExportTextItem(FString& ValueStr, const void* PropertyValue, const void* DefaultValue, class UObject* Parent, int32 PortFlags, class UObject* ExportRootScope) override { return false; }
+    virtual bool ImportTextItem(const TCHAR*& Buffer, void* Data, int32 PortFlags, class UObject* OwnerObject, FOutputDevice* ErrorText) override { return false; }
+    virtual bool FindInnerPropertyInstance(FName PropertyName, const void* Data, const FProperty*& OutProp, const void*& OutData) const override { return false; }
+    virtual TPointerToAddStructReferencedObjects AddStructReferencedObjects() override { return nullptr; }
+    virtual bool SerializeFromMismatchedTag(struct FPropertyTag const& Tag, FArchive& Ar, void* Data) override { return false; }
+    virtual bool StructuredSerializeFromMismatchedTag(struct FPropertyTag const& Tag, FStructuredArchive::FSlot Slot, void* Data) override { return false; }
+    virtual uint32 GetStructTypeHash(const void* Src) override { return 0; }
+    virtual void InitializeIntrusiveUnsetOptionalValue(void* Data) const override {}
+    virtual bool IsIntrusiveOptionalValueSet(const void* Data) const override { return false; }
+    virtual void ClearIntrusiveOptionalValue(void* Data) const override {}
+    virtual bool IsIntrusiveOptionalSafeForGC() const override { return false; }
+#if WITH_EDITOR
+    virtual bool CanEditChange(const FEditPropertyChain& PropertyChain, const void* Data) const override { return true; }
+#endif
+    virtual EPropertyVisitorControlFlow Visit(FPropertyVisitorContext& Context, const TFunctionRef<EPropertyVisitorControlFlow(const FPropertyVisitorContext& Context)> InFunc) const override { return EPropertyVisitorControlFlow::StepOver; }
+    virtual void* ResolveVisitedPathInfo(void* Data, const FPropertyVisitorInfo& Info) const override { return nullptr; }
+};
+
+// Helper: walks the super struct chain to find the nearest ancestor with CppStructOps
+static UScriptStruct::ICppStructOps* FindNearestAncestorCppStructOps(UScriptStruct* Struct)
+{
+    UScriptStruct* Current = Cast<UScriptStruct>(Struct->GetSuperStruct());
+    while (Current)
+    {
+        UScriptStruct::ICppStructOps* Ops = Current->GetCppStructOps();
+        if (Ops)
+        {
+            return Ops;
+        }
+        Current = Cast<UScriptStruct>(Current->GetSuperStruct());
+    }
+    return nullptr;
+}
+
+// Helper: checks if a property type can be represented as a blueprint pin.
+// Based on UEdGraphSchema_K2::GetPropertyCategoryInfo logic from the engine.
+// Container types are unwrapped and their inner/key/value types are checked recursively.
+static bool IsPropertyTypeBlueprintSupported(const FProperty* Property)
+{
+    // Unwrap container types and check inner properties
+    if (const FArrayProperty* ArrayProp = CastField<FArrayProperty>(Property))
+    {
+        return ArrayProp->Inner && IsPropertyTypeBlueprintSupported(ArrayProp->Inner);
+    }
+    if (const FSetProperty* SetProp = CastField<FSetProperty>(Property))
+    {
+        return SetProp->ElementProp && IsPropertyTypeBlueprintSupported(SetProp->ElementProp);
+    }
+    if (const FMapProperty* MapProp = CastField<FMapProperty>(Property))
+    {
+        // Weak object properties are not supported as map values
+        if (MapProp->ValueProp && CastField<FWeakObjectProperty>(MapProp->ValueProp))
+        {
+            return false;
+        }
+        return MapProp->KeyProp && IsPropertyTypeBlueprintSupported(MapProp->KeyProp)
+            && MapProp->ValueProp && IsPropertyTypeBlueprintSupported(MapProp->ValueProp);
+    }
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
+    if (const FOptionalProperty* OptionalProp = CastField<FOptionalProperty>(Property))
+    {
+        return OptionalProp->GetValueProperty() && IsPropertyTypeBlueprintSupported(OptionalProp->GetValueProperty());
+    }
+#endif
+
+    // Primitive and common types that always map to blueprint pin categories
+    if (Property->IsA<FBoolProperty>()) return true;
+    if (Property->IsA<FIntProperty>()) return true;
+    if (Property->IsA<FInt64Property>()) return true;
+    if (Property->IsA<FFloatProperty>()) return true;
+    if (Property->IsA<FDoubleProperty>()) return true;
+    if (Property->IsA<FByteProperty>()) return true;
+    if (Property->IsA<FNameProperty>()) return true;
+    if (Property->IsA<FStrProperty>()) return true;
+    if (Property->IsA<FTextProperty>()) return true;
+
+    // Enum types
+    if (Property->IsA<FEnumProperty>()) return true;
+
+    // Object types (check derived types before base)
+    if (Property->IsA<FInterfaceProperty>()) return true;
+    if (Property->IsA<FClassProperty>()) return true;
+    if (Property->IsA<FSoftClassProperty>()) return true;
+    if (Property->IsA<FSoftObjectProperty>()) return true;
+    if (Property->IsA<FObjectPropertyBase>()) return true;
+
+    // Struct types
+    if (Property->IsA<FStructProperty>()) return true;
+
+    // Delegate types
+    if (Property->IsA<FDelegateProperty>()) return true;
+    if (Property->IsA<FMulticastDelegateProperty>()) return true;
+
+    // Field path
+    if (Property->IsA<FFieldPathProperty>()) return true;
+
+    // Anything else is not representable as a blueprint pin
+    return false;
+}
+
 // Note that new objects can be created from other threads, but we only touch this map when creating dynamic classes,
 // so we do not need an explicit mutex to guard the access to it during class initialization
 static TMap<UClass*, FDynamicClassConstructionData> DynamicClassConstructionData;
@@ -416,7 +685,7 @@ UClass* FSuziePluginModule::FindOrCreateClass(FDynamicClassGenerationContext& Co
         NewClass = FindOrCreateUnregisteredClass(Context, ClassPath);
         if (NewClass == nullptr)
         {
-            UE_LOG(LogSuzie, Error, TEXT("Failed to create dynamic class: %s"), *ClassPath);
+            UE_LOG(LogSuzie, Warning, TEXT("Failed to create dynamic class: %s"), *ClassPath);
             return nullptr;
         }
     }
@@ -434,8 +703,9 @@ UClass* FSuziePluginModule::FindOrCreateClass(FDynamicClassGenerationContext& Co
     const TArray<TSharedPtr<FJsonValue>>& Properties = ClassDefinition->GetArrayField(TEXT("properties"));
     for (const TSharedPtr<FJsonValue>& PropertyDescriptor : Properties)
     {
-        // We want all properties to be editable, visible and blueprint assignable
-        const EPropertyFlags ExtraPropertyFlags = CPF_Edit | CPF_BlueprintVisible | CPF_BlueprintAssignable;
+        // We want all properties to be editable and blueprint assignable. Blueprint visibility is
+        // conditionally widened in BuildProperty based on the property type and CPF_Edit/CPF_EditConst flags.
+        const EPropertyFlags ExtraPropertyFlags = CPF_Edit | CPF_BlueprintAssignable;
         if (FProperty* CreatedProperty = AddPropertyToStruct(Context, NewClass, PropertyDescriptor->AsObject(), ExtraPropertyFlags))
         {
             // Because this is a native class, we have to link the property offset manually here rather than expecting StaticLink to do it for us
@@ -567,8 +837,9 @@ UScriptStruct* FSuziePluginModule::FindOrCreateScriptStruct(FDynamicClassGenerat
     TArray<TSharedPtr<FJsonValue>> Properties = StructDefinition->GetArrayField(TEXT("properties"));
     for (const TSharedPtr<FJsonValue>& PropertyDescriptor : Properties)
     {
-        // We want all properties to be editable, visible and blueprint assignable
-        const EPropertyFlags ExtraPropertyFlags = CPF_Edit | CPF_BlueprintVisible | CPF_BlueprintAssignable;
+        // We want all properties to be editable and blueprint assignable. Blueprint visibility is
+        // conditionally widened in BuildProperty based on the property type and CPF_Edit/CPF_EditConst flags.
+        const EPropertyFlags ExtraPropertyFlags = CPF_Edit | CPF_BlueprintAssignable;
         AddPropertyToStruct(Context, NewStruct, PropertyDescriptor->AsObject(), ExtraPropertyFlags);
     }
     
@@ -585,6 +856,49 @@ UScriptStruct* FSuziePluginModule::FindOrCreateScriptStruct(FDynamicClassGenerat
     {
         NewStruct->MinAlignment = 1;
         NewStruct->SetPropertiesSize(1);
+    }
+
+    // If an ancestor struct has CppStructOps (e.g. FTableRowBase with virtual functions and a vtable pointer),
+    // we need to create synthetic CppStructOps for this dynamic struct. Without this, the vtable pointer at offset 0
+    // would never be initialized, causing crashes when the engine calls virtual methods like OnDataTableChanged().
+    UScriptStruct::ICppStructOps* AncestorCppStructOps = FindNearestAncestorCppStructOps(NewStruct);
+    SuzieCustomSerializers::FStructSerializeFn CustomSerializeFn = SuzieCustomSerializers::FindStructSerializer(StructPath);
+    if (AncestorCppStructOps || CustomSerializeFn)
+    {
+        // Ensure PropertiesSize is aligned so that GetStructureSize() == PropertiesSize
+        // This is required because InitializeStruct checks: Stride == CppStructOps.GetSize() && PropertiesSize == CppStructOps.GetSize()
+        const int32 AlignedSize = NewStruct->GetStructureSize();
+        if (NewStruct->GetPropertiesSize() != AlignedSize)
+        {
+            NewStruct->SetPropertiesSize(AlignedSize);
+        }
+
+        FTopLevelAssetPath StructAssetPath(Package->GetFName(), *ObjectName);
+        UScriptStruct::DeferCppStructOps(StructAssetPath,
+            new FDynamicStructCppStructOps(
+                NewStruct->GetPropertiesSize(),
+                NewStruct->GetMinAlignment(),
+                AncestorCppStructOps,
+                NewStruct,
+                CustomSerializeFn
+            ));
+
+        // Reset and re-prepare so PrepareCppStructOps picks up our deferred synthetic CppStructOps
+        // (and, when CustomSerializeFn is set, flags the struct STRUCT_SerializeNative so the engine
+        // routes its cooked bytes through the hand-written serializer instead of the reflected path)
+        NewStruct->ClearCppStructOps();
+        NewStruct->PrepareCppStructOps();
+
+        if (CustomSerializeFn)
+        {
+            UE_LOG(LogSuzie, Log, TEXT("Installed hand-written binary serializer for natively-serialized struct '%s' (size=%d)"),
+                *StructPath, NewStruct->GetPropertiesSize());
+        }
+        else
+        {
+            UE_LOG(LogSuzie, Verbose, TEXT("Installed synthetic CppStructOps for struct '%s' (ancestor has vtable, size=%d)"),
+                *ObjectName, NewStruct->GetPropertiesSize());
+        }
     }
     
     UE_LOG(LogSuzie, Verbose, TEXT("Created struct: %s"), *ObjectName);
@@ -673,6 +987,11 @@ UFunction* FSuziePluginModule::FindOrCreateFunction(FDynamicClassGenerationConte
     {
         // This is a class path because it is at least two levels deep. We do not need our outer to be registered, just to exist
         FunctionOuterObject = FindOrCreateUnregisteredClass(Context, ClassPathOrPackageName);
+        if (FunctionOuterObject == nullptr)
+        {
+            UE_LOG(LogSuzie, Warning, TEXT("Skipping function %s: outer class %s could not be created (likely a re-entry cycle)"), *FunctionPath, *ClassPathOrPackageName);
+            return nullptr;
+        }
     }
     else
     {
@@ -735,7 +1054,17 @@ UFunction* FSuziePluginModule::FindOrCreateFunction(FDynamicClassGenerationConte
     }
 
     // Have to temporarily mark the function as RF_ArchetypeObject to be able to create functions with UPackage as outer
-    UFunction* NewFunction = NewObject<UFunction>(FunctionOuterObject, *ObjectName, RF_Public | RF_MarkAsRootSet | RF_ArchetypeObject);
+    // Delegate signature functions must be USparseDelegateFunction so that FMulticastSparseDelegateProperty::CastChecked succeeds.
+    // USparseDelegateFunction IS-A UFunction so all other code continues to work unmodified.
+    UFunction* NewFunction;
+    if (ObjectName.EndsWith(TEXT("__DelegateSignature")))
+    {
+        NewFunction = NewObject<USparseDelegateFunction>(FunctionOuterObject, *ObjectName, RF_Public | RF_MarkAsRootSet | RF_ArchetypeObject);
+    }
+    else
+    {
+        NewFunction = NewObject<UFunction>(FunctionOuterObject, *ObjectName, RF_Public | RF_MarkAsRootSet | RF_ArchetypeObject);
+    }
     NewFunction->ClearFlags(RF_ArchetypeObject);
     NewFunction->FunctionFlags |= FunctionFlags;
 
@@ -1024,6 +1353,22 @@ FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Con
         UFunction* SignatureFunction = FindOrCreateFunction(Context, PropertyJson->GetStringField(TEXT("signature_function")));
         // Fall back to FOnTimelineEvent delegate signature in the engine if real delegate signature could not be found
         MulticastDelegateProperty->SignatureFunction = SignatureFunction ? SignatureFunction : FindObject<UFunction>(nullptr, TEXT("/Script/Engine.OnTimelineEvent__DelegateSignature"));
+
+        // Sparse delegate serialization resolves the delegate's owner through the signature
+        // function's OwningClassName/DelegateName pair (see FMulticastSparseDelegateProperty::
+        // SerializeItemInternal). UHT fills these for native classes; do the same for dynamic
+        // classes. The matching member offset is registered in FinalizeClass once the CDO exists.
+        if (NewProperty->IsA<FMulticastSparseDelegateProperty>())
+        {
+            if (USparseDelegateFunction* SparseSignature = Cast<USparseDelegateFunction>(MulticastDelegateProperty->SignatureFunction))
+            {
+                if (const UClass* OwningClass = Cast<UClass>(Owner.ToUObject()); OwningClass && SparseSignature->OwningClassName.IsNone())
+                {
+                    SparseSignature->OwningClassName = OwningClass->GetFName();
+                    SparseSignature->DelegateName = NewProperty->GetFName();
+                }
+            }
+        }
     }
     else if (FFieldPathProperty* FieldPathProperty = CastField<FFieldPathProperty>(NewProperty))
     {
@@ -1061,6 +1406,21 @@ FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Con
         
             MapProperty->AddCppProperty(KeyProp);
             MapProperty->AddCppProperty(ValueProp);
+        }
+    }
+
+    // Access widening: forcefully widen editor-visible properties to blueprint-visible when the type supports it.
+    // This ensures as many properties as possible are accessible in blueprints without requiring explicit tagging.
+    // CPF_EditConst properties become read-only in blueprints; CPF_Edit properties become read-write.
+    if (IsPropertyTypeBlueprintSupported(NewProperty))
+    {
+        if (NewProperty->HasAnyPropertyFlags(CPF_EditConst))
+        {
+            NewProperty->PropertyFlags |= CPF_BlueprintVisible | CPF_BlueprintReadOnly;
+        }
+        else if (NewProperty->HasAnyPropertyFlags(CPF_Edit))
+        {
+            NewProperty->PropertyFlags |= CPF_BlueprintVisible;
         }
     }
 
@@ -1354,8 +1714,54 @@ void FSuziePluginModule::PolymorphicClassConstructorInvocationHelper(const FObje
     const FDynamicClassConstructionData* TopLevelClassConstructionData = DynamicClassConstructionData.Find(TopLevelDynamicClass);
     checkf(TopLevelClassConstructionData, TEXT("Failed to find dynamic class construction data for dynamic class %s"), *TopLevelDynamicClass->GetPathName());
 
+    // Run logic necessary for the top level dynamic class object. That includes setting up defautl subobject overrides and the active archetype to use for property copying
+    {
+        // If no explicit archetype has been provided for this object construction, or archetype is a CDO of the current class, set it to the default object archetype instead
+        // This will ensure that correct property values are copied from the CDO for all object properties and subobjects are created using correct templates and not their CDO values
+        // This has to be done before we call the parent constructor and create any default subobjects
+        //
+        // Only redirect when the object being constructed is exactly the top level dynamic class. 
+        // The DefaultObjectArchetype is an instance sized to TopLevelDynamicClass; if the object is a more-derived class
+        // FObjectInitializer::InitProperties walks the derived class's property list and copies each property out of this smaller parent-sized archetype. 
+        // Properties the subclass adds live past the end of the archetype's allocation, so the engine reads out of bounds - which
+        // corrupts non-trivially-constructed values and crashes. 
+        // For derived classes we leave the engine's natural archetype (the derived class's own CDO) in place,
+        // which is full-sized and already carries the correct inherited + Blueprint-added defaults.
+        if ((ObjectInitializer.GetArchetype() == nullptr || ObjectInitializer.GetArchetype() == ObjectInitializer.GetClass()->ClassDefaultObject)
+            && TopLevelClassConstructionData->DefaultObjectArchetype
+            && TopLevelDynamicClass == ObjectInitializer.GetClass())
+        {
+            FObjectInitializerAccessStub* ObjectInitializerAccess = reinterpret_cast<FObjectInitializerAccessStub*>(&ObjectInitializer.Get());
+            ObjectInitializerAccess->ObjectArchetype = TopLevelClassConstructionData->DefaultObjectArchetype;
+            ObjectInitializerAccess->bCopyTransientsFromClassDefaults = true; // we want to copy the transient property values from archetype as well
+        }
+        
+        // Before we execute the class constructor of our parent native class, apply overrides to subobject types that the parent class might create
+        for (const FDynamicObjectConstructionData& SubobjectConstructionData : TopLevelClassConstructionData->DefaultSubobjects)
+        {
+            // ReSharper disable once CppExpressionWithoutSideEffects
+            ObjectInitializer.SetDefaultSubobjectClass(SubobjectConstructionData.ObjectName, SubobjectConstructionData.ObjectClass);
+        }
+        // Disable creation of certain subobjects that this class does not want to have
+        for (const FName& DisabledSubobjectName : TopLevelClassConstructionData->SuppressedDefaultSubobjects)
+        {
+            // ReSharper disable once CppExpressionWithoutSideEffects
+            ObjectInitializer.DoNotCreateDefaultSubobject(DisabledSubobjectName);
+        }
+        
+        // Also apply overrides for nested subobject types. These are very rare but should be handled regardless
+        // TODO: We do not handle disabled nested default subobjects currently. Case is extremely rare and nested subobjects are extremely rare themselves, so this can be revised later
+        for (const FNestedDefaultSubobjectOverrideData& SubobjectOverrideData : TopLevelClassConstructionData->DefaultSubobjectOverrides)
+        {
+            // ReSharper disable once CppExpressionWithoutSideEffects
+            ObjectInitializer.SetNestedDefaultSubobjectClass(SubobjectOverrideData.SubobjectPath, SubobjectOverrideData.OverridenClass);
+        }
+    }
+    
+    // Run the constructor for that parent native class now to get an initialized object of the parent class type and parent default subobjects
+    NativeParentClass->ClassConstructor(ObjectInitializer);
+
     // Gather all dynamic classes that contribute to the object being constructed, starting at the top level one
-    // We need this list BEFORE applying subobject overrides to handle the entire hierarchy
     TArray<const UClass*, TInlineAllocator<8>> DynamicClassHierarchyTree;
     const UClass* CurrentDynamicClass = TopLevelDynamicClass;
     while (CurrentDynamicClass->ClassConstructor == &FSuziePluginModule::PolymorphicClassConstructorInvocationHelper)
@@ -1363,71 +1769,6 @@ void FSuziePluginModule::PolymorphicClassConstructorInvocationHelper(const FObje
         DynamicClassHierarchyTree.Add(CurrentDynamicClass);
         CurrentDynamicClass = CurrentDynamicClass->GetSuperClass();
     }
-
-    // Run logic necessary for the top level dynamic class object. That includes setting up default subobject overrides and the active archetype to use for property copying
-    {
-        // If no explicit archetype has been provided for this object construction, or archetype is a CDO of the current class, set it to the default object archetype instead
-        // This will ensure that correct property values are copied from the CDO for all object properties and subobjects are created using correct templates and not their CDO values
-        // This has to be done before we call the parent constructor and create any default subobjects
-        if ((ObjectInitializer.GetArchetype() == nullptr || ObjectInitializer.GetArchetype() == ObjectInitializer.GetClass()->ClassDefaultObject) && TopLevelClassConstructionData->DefaultObjectArchetype)
-        {
-            FObjectInitializerAccessStub* ObjectInitializerAccess = reinterpret_cast<FObjectInitializerAccessStub*>(&ObjectInitializer.Get());
-            ObjectInitializerAccess->ObjectArchetype = TopLevelClassConstructionData->DefaultObjectArchetype;
-            ObjectInitializerAccess->bCopyTransientsFromClassDefaults = true; // we want to copy the transient property values from archetype as well
-        }
-
-        // Collect subobject overrides from the ENTIRE dynamic class hierarchy, not just the top-level class.
-        // Child class overrides take precedence over parent class definitions, so we iterate from parent to child
-        // and let later entries overwrite earlier ones.
-        TMap<FName, UClass*> FinalSubobjectClasses;
-        TSet<FName> AllSuppressedSubobjects;
-        TArray<FNestedDefaultSubobjectOverrideData> AllNestedOverrides;
-
-        // Iterate from furthest parent to top-level class (reverse order)
-        for (int32 i = DynamicClassHierarchyTree.Num() - 1; i >= 0; i--)
-        {
-            const FDynamicClassConstructionData* ClassConstructionData = DynamicClassConstructionData.Find(DynamicClassHierarchyTree[i]);
-            if (ClassConstructionData)
-            {
-                // Collect subobject classes - child overrides parent
-                for (const FDynamicObjectConstructionData& SubobjectData : ClassConstructionData->DefaultSubobjects)
-                {
-                    FinalSubobjectClasses.Add(SubobjectData.ObjectName, SubobjectData.ObjectClass);
-                }
-                // Collect suppressed subobjects
-                for (const FName& SuppressedName : ClassConstructionData->SuppressedDefaultSubobjects)
-                {
-                    AllSuppressedSubobjects.Add(SuppressedName);
-                }
-                // Collect nested overrides
-                AllNestedOverrides.Append(ClassConstructionData->DefaultSubobjectOverrides);
-            }
-        }
-
-        // Apply all subobject class overrides before running any constructor
-        for (const auto& [SubobjectName, SubobjectClass] : FinalSubobjectClasses)
-        {
-            // ReSharper disable once CppExpressionWithoutSideEffects
-            ObjectInitializer.SetDefaultSubobjectClass(SubobjectName, SubobjectClass);
-        }
-
-        // Disable creation of certain subobjects that any class in the hierarchy does not want to have
-        for (const FName& DisabledSubobjectName : AllSuppressedSubobjects)
-        {
-            // ReSharper disable once CppExpressionWithoutSideEffects
-            ObjectInitializer.DoNotCreateDefaultSubobject(DisabledSubobjectName);
-        }
-
-        // Apply overrides for nested subobject types
-        for (const FNestedDefaultSubobjectOverrideData& SubobjectOverrideData : AllNestedOverrides)
-        {
-            // ReSharper disable once CppExpressionWithoutSideEffects
-            ObjectInitializer.SetNestedDefaultSubobjectClass(SubobjectOverrideData.SubobjectPath, SubobjectOverrideData.OverridenClass);
-        }
-    }
-
-    // Run the constructor for that parent native class now to get an initialized object of the parent class type and parent default subobjects
-    NativeParentClass->ClassConstructor(ObjectInitializer);
 
     // Run constructors for each dynamic class in reverse order, e.g. from the furthest parent to the top level class
     for (int32 i = DynamicClassHierarchyTree.Num() - 1; i >= 0; i--)
@@ -1447,15 +1788,11 @@ void FSuziePluginModule::ExecutePolymorphicClassConstructorFrameForDynamicClass(
     {
         Property->InitializeValue_InContainer(ObjectInitializer.GetObj());
     }
-
+    
     // Create missing default subobjects for this dynamic class type
-    // NOTE: We check by NAME only (using UObject::StaticClass()), not by specific class type.
-    // This is because a child class in the hierarchy may have overridden the subobject's class type,
-    // and the subobject will have been created with the overridden type (via SetDefaultSubobjectClass).
-    // If we checked by the original class type, we wouldn't find it and would try to create a duplicate.
     for (const FDynamicObjectConstructionData& SubobjectConstructionData : ClassConstructionData->DefaultSubobjects)
     {
-        if (StaticFindObjectFast(UObject::StaticClass(), ObjectInitializer.GetObj(), SubobjectConstructionData.ObjectName) == nullptr)
+        if (StaticFindObjectFast(SubobjectConstructionData.ObjectClass, ObjectInitializer.GetObj(), SubobjectConstructionData.ObjectName) == nullptr)
         {
             ObjectInitializer.CreateDefaultSubobject(ObjectInitializer.GetObj(),
                 SubobjectConstructionData.ObjectName, UObject::StaticClass(), SubobjectConstructionData.ObjectClass,
@@ -1596,12 +1933,30 @@ void FSuziePluginModule::FinalizeClass(FDynamicClassGenerationContext& Context, 
     // Create class default object now that we have class object construction data
     UObject* ClassDefaultObject = Class->GetDefaultObject(true);
 
+    // Register sparse delegate member offsets for this class. UHT-generated code does this for
+    // native classes; without it FSparseDelegateStorage::ResolveSparseOwner check-fails when a
+    // cooked asset deserializes a bound sparse delegate of a dynamic class.
+    for (FField* Field = Class->ChildProperties; Field; Field = Field->Next)
+    {
+        if (const FMulticastSparseDelegateProperty* SparseDelegateProperty = CastField<FMulticastSparseDelegateProperty>(Field))
+        {
+            FSparseDelegateStorage::RegisterDelegateOffset(ClassDefaultObject, SparseDelegateProperty->GetFName(), SparseDelegateProperty->GetOffset_ForInternal());
+        }
+    }
+
     // Recursively deserialize property values for the default object and its subobjects (and their nested subobjects)
     DeserializeObjectAndSubobjectPropertyValuesRecursive(Context, ClassDefaultObject, ClassDefaultObjectDefinition);
 
     // Create an archetype by duplicating the CDO. We will use that archetype instead of CDO for priming the instances with correct values
     // Do not create archetypes for NetConnection-derived classes, they have faulty shutdown logic leading to a crash on exit
-    if (!Class->IsChildOf<UNetConnection>())
+    // Do not create archetypes for GameInstance-derived classes, EndPlayMap iterates all UGameInstance objects and calls
+    // MarkAsGarbage on them which asserts !IsRooted(), but our archetypes are rooted via AddToRoot to prevent GC
+    // Do not create archetypes for WaterBody-derived classes: PostDuplicate on UWaterBodyComponent calls UpdateWaterBody->OnUpdateBody
+    // which calls RegisterComponent on dynamically-created collision components. RegisterComponent requires a valid world,
+    // but the archetype actor is not part of any world, triggering an ensure failure.
+    static const UClass* WaterBodyClass = FindObject<UClass>(nullptr, TEXT("/Script/Water.WaterBody"));
+    const bool bIsWaterBodyClass = WaterBodyClass && Class->IsChildOf(WaterBodyClass);
+    if (!Class->IsChildOf<UNetConnection>() && !Class->IsChildOf<UGameInstance>() && !bIsWaterBodyClass)
     {
         const FString ArchetypeObjectName = TEXT("InitializationArchetype__") + Class->GetName();
         {
